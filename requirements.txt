@@ -2,3 +2,4 @@ streamlit
 numpy
 opencv-contrib-python
 pandas
+opencv-contrib-python==4.5.5.64
