@@ -1,104 +1,118 @@
 import streamlit as st
-import face_recognition
 import cv2
-import numpy as np
 import os
-import pandas as pd
+import numpy as np
 from datetime import datetime
+import pandas as pd
 
-# Paths
-KNOWN_FACES_DIR = 'data/known_faces'
-ATTENDANCE_FILE = 'data/attendance.csv'
+DATA_DIR = "data/known_faces"
+ATTENDANCE_FILE = "data/attendance.csv"
 
-# Utility: Load known face encodings
-def load_known_faces():
-    known_encodings = []
-    known_names = []
-    for filename in os.listdir(KNOWN_FACES_DIR):
-        if filename.endswith(('.jpg', '.png')):
-            image = face_recognition.load_image_file(f"{KNOWN_FACES_DIR}/{filename}")
-            encoding = face_recognition.face_encodings(image)
-            if encoding:
-                known_encodings.append(encoding[0])
-                known_names.append(os.path.splitext(filename)[0])
-    return known_encodings, known_names
+# Load Haar Cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Utility: Mark attendance in CSV
+# Train recognizer
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+def train_model():
+    faces = []
+    labels = []
+    label_map = {}
+    label_id = 0
+
+    for person in os.listdir(DATA_DIR):
+        person_path = os.path.join(DATA_DIR, person)
+        if not os.path.isdir(person_path): continue
+
+        label_map[label_id] = person
+        for img_file in os.listdir(person_path):
+            img_path = os.path.join(person_path, img_file)
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if img is None: continue
+            faces.append(img)
+            labels.append(label_id)
+        label_id += 1
+
+    if faces:
+        recognizer.train(faces, np.array(labels))
+        return label_map
+    return {}
+
 def mark_attendance(name):
     now = datetime.now()
-    date_str = now.strftime('%Y-%m-%d')
-    time_str = now.strftime('%H:%M:%S')
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    new_entry = {'Name': name, 'Date': date_str, 'Time': time_str}
 
     if not os.path.exists(ATTENDANCE_FILE):
-        pd.DataFrame(columns=['Name', 'Date', 'Time']).to_csv(ATTENDANCE_FILE, index=False)
+        pd.DataFrame([new_entry]).to_csv(ATTENDANCE_FILE, index=False)
+    else:
+        df = pd.read_csv(ATTENDANCE_FILE)
+        if not ((df['Name'] == name) & (df['Date'] == date_str)).any():
+            df = pd.concat([df, pd.DataFrame([new_entry])], ignore_index=True)
+            df.to_csv(ATTENDANCE_FILE, index=False)
 
-    df = pd.read_csv(ATTENDANCE_FILE)
-    if not ((df['Name'] == name) & (df['Date'] == date_str)).any():
-        new_entry = pd.DataFrame([[name, date_str, time_str]], columns=['Name', 'Date', 'Time'])
-        df = pd.concat([df, new_entry], ignore_index=True)
-        df.to_csv(ATTENDANCE_FILE, index=False)
+def detect_and_recognize(image, label_map):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces_rects = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-# Streamlit App
-st.set_page_config(page_title="Attendance System", layout="wide")
+    for (x, y, w, h) in faces_rects:
+        roi_gray = gray[y:y + h, x:x + w]
+        try:
+            roi_gray = cv2.resize(roi_gray, (200, 200))
+            label, confidence = recognizer.predict(roi_gray)
+            name = label_map.get(label, "Unknown")
+            if confidence < 70:
+                mark_attendance(name)
+                label_text = f"{name} ({confidence:.1f})"
+            else:
+                label_text = "Unknown"
+        except:
+            label_text = "Error"
+
+        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(image, label_text, (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    return image
+
+# Streamlit UI
 st.title("📸 Attendance Recognition System")
+label_map = train_model()
 
-tab1, tab2 = st.tabs(["📂 Upload Faces", "🟢 Start Recognition"])
+option = st.radio("Select input mode:", ["📷 Webcam", "📁 Upload Image"])
 
-with tab1:
-    st.header("Upload Known Faces")
-    uploaded_files = st.file_uploader("Upload Images (Name the files as the person's name)", type=['jpg', 'png'], accept_multiple_files=True)
-    if uploaded_files:
-        for file in uploaded_files:
-            with open(f"{KNOWN_FACES_DIR}/{file.name}", 'wb') as f:
-                f.write(file.getbuffer())
-        st.success("✅ Faces uploaded successfully!")
+if option == "📁 Upload Image":
+    uploaded = st.file_uploader("Upload a face image", type=["jpg", "png", "jpeg"])
+    if uploaded:
+        file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, 1)
+        result = detect_and_recognize(img, label_map)
+        st.image(result, channels="BGR", caption="Processed Image")
 
-with tab2:
-    st.header("Live Face Recognition")
-    start = st.button("Start Webcam")
-
-    if start:
-        stframe = st.empty()
-        video = cv2.VideoCapture(0)
-
-        known_encodings, known_names = load_known_faces()
-
-        while True:
-            ret, frame = video.read()
-            if not ret:
-                break
-
-            small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-            rgb_small_frame = small_frame[:, :, ::-1]
-
-            face_locations = face_recognition.face_locations(rgb_small_frame)
-            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-
-            for face_encoding, face_location in zip(face_encodings, face_locations):
-                matches = face_recognition.compare_faces(known_encodings, face_encoding)
-                face_distances = face_recognition.face_distance(known_encodings, face_encoding)
-                best_match_index = np.argmin(face_distances)
-
-                if matches[best_match_index]:
-                    name = known_names[best_match_index]
-                    mark_attendance(name)
-
-                    top, right, bottom, left = face_location
-                    top *= 4
-                    right *= 4
-                    bottom *= 4
-                    left *= 4
-
-                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                    cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-
-            stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels='RGB')
-
-        video.release()
-
-st.sidebar.header("📅 Attendance Log")
-if os.path.exists(ATTENDANCE_FILE):
-    df = pd.read_csv(ATTENDANCE_FILE)
-    st.sidebar.dataframe(df)
 else:
-    st.sidebar.info("No attendance data yet.")
+    run = st.checkbox("Start Webcam")
+    frame_placeholder = st.empty()
+
+    cap = None
+    if run:
+        cap = cv2.VideoCapture(0)
+
+    while run and cap and cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Failed to access webcam.")
+            break
+
+        result = detect_and_recognize(frame, label_map)
+        frame_placeholder.image(result, channels="BGR")
+
+    if cap:
+        cap.release()
+
+# View attendance
+if st.button("📄 View Attendance"):
+    if os.path.exists(ATTENDANCE_FILE):
+        df = pd.read_csv(ATTENDANCE_FILE)
+        st.dataframe(df)
+    else:
+        st.info("No attendance data found.")
